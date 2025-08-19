@@ -1,0 +1,99 @@
+---
+- name: Install Docker and run Confluence stack
+  hosts: localhost
+  become: true
+  gather_facts: true
+
+  vars:
+    vault_addr: "http://77.221.140.212:8201"
+    vault_mount_point: "secret"
+    vault_path: "confluence"
+    project_dir: "{{ playbook_dir }}"   # contains confluence-compose.yml and variables.env.j2
+
+  vars_files:
+    - secret_vault_token.yml            # contains: vaultToken: !vault | ...
+
+  pre_tasks:
+    - name: Install base deps
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Ensure keyring dir exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Install Docker GPG key to keyring
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.gpg
+        mode: "0644"
+
+    # Remove potentially conflicting repository entries
+    - name: Remove legacy docker.list
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/docker.list
+        state: absent
+
+    - name: Remove inline Docker repo from sources.list
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list
+        regexp: '^deb .*download\.docker\.com/linux/ubuntu'
+        state: absent
+
+    - name: Add Docker apt repository (stable, with signed-by)
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+        update_cache: yes
+
+  tasks:
+    - name: Install Docker Engine + CLI + Compose
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is started
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Getting HashiCorp secrets (KV v2)
+      community.hashi_vault.vault_kv2_get:
+        url: "{{ vault_addr }}"
+        engine_mount_point: "{{ vault_mount_point }}"
+        path: "{{ vault_path }}"
+        token: "{{ vaultToken }}"          # from secret_vault_token.yml
+      register: vault_secrets
+
+    - name: Create env file for compose from template
+      ansible.builtin.template:
+        src: variables.env.j2
+        dest: "{{ project_dir }}/variables.env"
+        mode: "0600"
+      vars:
+        secret: "{{ vault_secrets.secret.data }}"   # fields from KV: secret.<key>
+
+    - name: Run Docker Compose
+      ansible.builtin.command:
+        cmd: docker compose -f confluence-compose.yml up -d
+        chdir: "{{ project_dir }}"
+
+    - name: Remove sensitive .env file
+      ansible.builtin.file:
+        path: "{{ project_dir }}/variables.env"
+        state: absent
