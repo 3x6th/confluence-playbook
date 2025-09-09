@@ -1,30 +1,40 @@
-version: '3.4'
 services:
   confluence:
-#    image: haxqer/confluence:10.0.2
+#    image: haxqer/confluence:9.5.3
     build: .
     container_name: confluence-srv
+#    user: "999:999"
     environment:
-      - TZ=Asia/Shanghai
-#      - JVM_MINIMUM_MEMORY=1g
-#      - JVM_MAXIMUM_MEMORY=4g
+      - TZ=UTC
+      - JVM_MINIMUM_MEMORY=1g
+      - JVM_MAXIMUM_MEMORY=4g
+#      - ATL_JAVA_OPTS=-Xms4g -Xmx4g -XX:ReservedCodeCacheSize=512m
+#      - CATALINA_OPTS=-Xms4g -Xmx4g -XX:InitialCodeCacheSize=256m -XX:ReservedCodeCacheSize=512m
+      - JVM_SUPPORT_RECOMMENDED_ARGS=-Datlassian.upm.signature.check.disabled=true
 #      - JVM_CODE_CACHE_ARGS='-XX:InitialCodeCacheSize=1g -XX:ReservedCodeCacheSize=4g'
     depends_on:
       - mysql
     ports:
       - "8090:8090"
     volumes:
-      - confluence_data:/var/confluence
+      - home_data:/var/confluence
+      - truststore_ro:/var/confluence/upmconfig/truststore:ro
     restart: always
     networks:
       - network-bridge
+      - atlassian-net
+    mem_limit: 6g
+    memswap_limit: 6g
+    shm_size: 1g
 
   mysql:
     image: mysql:8.0
     container_name: mysql-confluence
-    env_file: 
+    environment:
+    - TZ=UTC
+    env_file:
     - ./variables.env
-    command: ['mysqld', '--character-set-server=utf8mb4', '--collation-server=utf8mb4_bin']
+    command: ['mysqld', '--character-set-server=utf8mb4', '--collation-server=utf8mb4_bin', '--transaction-isolation=READ-COMMITTED', '--innodb_log_file_size=256M', '--max_allowed_packet=256M','--log_bin_trust_function_creators=1']
     volumes:
       - mysql_data:/var/lib/mysql
     restart: always
@@ -34,9 +44,13 @@ services:
 networks:
   network-bridge:
     driver: bridge
+  atlassian-net:
+    external: true
 
 volumes:
-  confluence_data:
+  home_data:
     external: false
   mysql_data:
+    external: false
+  truststore_ro:
     external: false

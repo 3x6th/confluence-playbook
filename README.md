@@ -2,6 +2,12 @@
 
 This repository contains Ansible playbooks and Docker Compose configurations for deploying Confluence with MySQL.
 
+## RUN
+
+```bash
+ansible-playbook -i 'localhost,' -c local confluence-playbook.yml   --ask-vault-pass
+```
+
 ## Files
 
 - `confluence-compose.yml` - Docker Compose configuration for Confluence and MySQL

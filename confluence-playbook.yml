@@ -1,5 +1,5 @@
 ---
-- name: Install Docker and run Confluence stack
+- name: Check Docker and run Confluence stack
   hosts: localhost
   become: true
   gather_facts: true
@@ -8,10 +8,17 @@
     vault_addr: "http://77.221.140.212:8201"
     vault_mount_point: "secret"
     vault_path: "confluence"
-    project_dir: "{{ playbook_dir }}"   # contains confluence-compose.yml and variables.env.j2
+    project_dir: "{{ playbook_dir }}"   # confluence-compose.yml и variables.env.j2 здесь
+    truststore_volume: "confluence-playbook_truststore_ro"
+    ca_bundle_url: "https://confluence.atlassian.com/upm/files/1489470540/1489470538/1/1736436578459/atlassian_ca_bundle-v1.tar.gz"
+    ca_bundle_local: "/root/atlassian_ca_bundle-v1.tar.gz"
+    ca_bundle_dir: "/root/atlassian_ca_bundle"
+    # владелец/группа для файлов в truststore (не пользователь продукта!)
+    truststore_owner_uid: 65534   # nobody
+    truststore_owner_gid: 65533   # обычно 'nogroup' в Debian/Ubuntu
 
   vars_files:
-    - secret_vault_token.yml            # contains: vaultToken: !vault | ...
+    - secret_vault_token.yml
 
   pre_tasks:
     - name: Ensure keyring dir exists
@@ -27,12 +34,91 @@
         state: started
         enabled: true
 
+    - name: Create docker network for Atlassian stack
+      community.docker.docker_network:
+        name: atlassian-net
+        state: present
+
+    - name: Ensure truststore volume exists
+      community.docker.docker_volume:
+        name: "{{ truststore_volume }}"
+        state: present
+
+    - name: Get truststore volume mountpoint
+      ansible.builtin.command:
+        cmd: "docker volume inspect {{ truststore_volume }} --format {{'{{.Mountpoint}}'}}"
+      register: truststore_mp
+      changed_when: false
+
+    - name: Ensure truststore dir exists (host side)
+      ansible.builtin.file:
+        path: "{{ truststore_mp.stdout }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Atlassian CA bundle
+      ansible.builtin.get_url:
+        url: "{{ ca_bundle_url }}"
+        dest: "{{ ca_bundle_local }}"
+        mode: "0644"
+
+    - name: Unpack CA bundle to temp dir
+      ansible.builtin.unarchive:
+        src: "{{ ca_bundle_local }}"
+        dest: "{{ ca_bundle_dir }}"
+        remote_src: true
+        mode: "0755"
+
+    - name: Copy only *.crt from bundle into truststore
+      ansible.builtin.shell: |
+        shopt -s nullglob
+        for f in "{{ ca_bundle_dir }}"/*.crt "{{ ca_bundle_dir }}"/*.pem; do
+          [ -f "$f" ] || continue
+          # копируем только CA-файлы; *.pem тоже допустимы — UPM берёт x509
+          cp -f "$f" "{{ truststore_mp.stdout }}/"
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Remove macOS resource fork files (._*)
+      ansible.builtin.shell: |
+        find "{{ truststore_mp.stdout }}" -maxdepth 1 -type f -name "._*" -print -delete
+      args:
+        executable: /bin/bash
+
+    - name: Leave only Atlassian MPAC Root/Intermediate certs (optional tidy-up)
+      ansible.builtin.shell: |
+        cd "{{ truststore_mp.stdout }}"
+        for f in *; do
+          case "$f" in
+            atlassian_mpac_root_ca_v1.crt|atlassian_mpac_intermediate_ca_v1.crt) ;;
+            *) rm -f -- "$f" ;;
+          esac
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Set owner and permissions on truststore files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: "{{ truststore_owner_uid }}"
+        group: "{{ truststore_owner_gid }}"
+        mode: "0444"
+        state: file
+      with_fileglob:
+        - "{{ truststore_mp.stdout }}/*"
+
+    - name: Ensure truststore dir perms are read/execute only for product user (no write)
+      ansible.builtin.file:
+        path: "{{ truststore_mp.stdout }}"
+        mode: "0755"
+
     - name: Getting HashiCorp secrets (KV v2)
       community.hashi_vault.vault_kv2_get:
         url: "{{ vault_addr }}"
         engine_mount_point: "{{ vault_mount_point }}"
         path: "{{ vault_path }}"
-        token: "{{ vaultToken }}"          # from secret_vault_token.yml
+        token: "{{ vaultToken }}"
       register: vault_secrets
 
     - name: Create env file for compose from template
@@ -41,14 +127,89 @@
         dest: "{{ project_dir }}/variables.env"
         mode: "0600"
       vars:
-        secret: "{{ vault_secrets.secret.data }}"   # fields from KV: secret.<key>
+        secret: "{{ vault_secrets.secret.data }}"
 
     - name: Run Docker Compose
       ansible.builtin.command:
-        cmd: docker compose -f confluence-compose.yml up -d
+        cmd: docker compose -f confluence-compose.yml up -d #--no-deps --force-recreate confluence
         chdir: "{{ project_dir }}"
 
     - name: Remove sensitive .env file
       ansible.builtin.file:
         path: "{{ project_dir }}/variables.env"
         state: absent
+
+    - name: Ensure truststore volume exists
+      community.docker.docker_volume:
+        name: "{{ truststore_volume }}"
+        state: present
+
+    - name: Get truststore volume mountpoint
+      ansible.builtin.command:
+        cmd: "docker volume inspect {{ truststore_volume }} --format {{'{{.Mountpoint}}'}}"
+      register: truststore_mp
+      changed_when: false
+
+    - name: Ensure truststore dir exists (host side)
+      ansible.builtin.file:
+        path: "{{ truststore_mp.stdout }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Atlassian CA bundle
+      ansible.builtin.get_url:
+        url: "{{ ca_bundle_url }}"
+        dest: "{{ ca_bundle_local }}"
+        mode: "0644"
+        # при желании добавьте checksum: "sha256:...."
+
+    - name: Unpack CA bundle to temp dir
+      ansible.builtin.unarchive:
+        src: "{{ ca_bundle_local }}"
+        dest: "{{ ca_bundle_dir }}"
+        remote_src: true
+        mode: "0755"
+
+    - name: Copy only *.crt from bundle into truststore
+      ansible.builtin.shell: |
+        shopt -s nullglob
+        for f in "{{ ca_bundle_dir }}"/*.crt "{{ ca_bundle_dir }}"/*.pem; do
+          [ -f "$f" ] || continue
+          # копируем только CA-файлы; *.pem тоже допустимы — UPM берёт x509
+          cp -f "$f" "{{ truststore_mp.stdout }}/"
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Remove macOS resource fork files (._*)
+      ansible.builtin.shell: |
+        find "{{ truststore_mp.stdout }}" -maxdepth 1 -type f -name "._*" -print -delete
+      args:
+        executable: /bin/bash
+
+    - name: Leave only Atlassian MPAC Root/Intermediate certs (optional tidy-up)
+      ansible.builtin.shell: |
+        cd "{{ truststore_mp.stdout }}"
+        for f in *; do
+          case "$f" in
+            atlassian_mpac_root_ca_v1.crt|atlassian_mpac_intermediate_ca_v1.crt) ;;
+            *) rm -f -- "$f" ;;
+          esac
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Set owner and permissions on truststore files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: "{{ truststore_owner_uid }}"
+        group: "{{ truststore_owner_gid }}"
+        mode: "0444"
+        state: file
+      with_fileglob:
+        - "{{ truststore_mp.stdout }}/*"
+
+    - name: Ensure truststore dir perms are read/execute only for product user (no write)
+      ansible.builtin.file:
+        path: "{{ truststore_mp.stdout }}"
+        mode: "0755"
